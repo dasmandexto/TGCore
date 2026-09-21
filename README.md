@@ -1,4 +1,4 @@
-# Telegram Suite — модульный набор инструментов для Telegram
+# TGCore — модульный набор инструментов для Telegram
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Telethon](https://img.shields.io/badge/telethon-1.45-green)
