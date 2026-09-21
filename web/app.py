@@ -1,0 +1,414 @@
+"""FastAPI-приложение: веб-обёртка над модулями (checker, broadcast).
+
+Один Context создаётся на старте приложения и переиспользуется всеми
+запросами (SQLite, пул прокси, rate limiter). Долгие операции (чекер,
+рассылка) запускаются в фоне через asyncio.create_task, статус — в /api/tasks.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from config import Settings
+from core import Context
+from core.schemas import MODULE_SCHEMAS, build_argv, validate_schema_module
+from plugins import PluginDeps, get_registry
+
+log = logging.getLogger(__name__)
+
+_tasks: dict[str, dict] = {}
+
+
+def _build_deps(ctx: Context, settings: Settings) -> PluginDeps:
+    return PluginDeps(
+        storage=ctx.storage,
+        rate_limiter=ctx.rate_limiter,
+        proxies=ctx.proxies,
+        sessions=ctx.sessions,
+        api_id=settings.api_id,
+        api_hash=settings.api_hash,
+    )
+
+
+def create_app(settings: Settings) -> FastAPI:
+    ctx = Context(settings)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        yield
+        ctx.close()
+
+    app = FastAPI(title="Telegram Suite Web", lifespan=lifespan)
+    registry = get_registry()
+    registry.auto_discover()
+
+    static_dir = Path(__file__).parent / "static"
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    # ---------------- страница ----------------
+    @app.get("/")
+    async def index():
+        return FileResponse(str(static_dir / "index.html"))
+
+    # ---------------- обзор ----------------
+    @app.get("/api/overview")
+    async def overview():
+        modules = [
+            {"name": n, "description": registry.get(n).description}
+            for n in registry.names()
+        ]
+        accounts = []
+        for name in ctx.sessions.list_session_names():
+            st = ctx.storage.account_status(name)
+            accounts.append(
+                {
+                    "name": name,
+                    "status": st["status"] if st else "unknown",
+                    "detail": st["detail"] if st else None,
+                }
+            )
+        events = ctx.storage.recent_events(limit=50)
+        return {
+            "modules": modules,
+            "accounts": accounts,
+            "events": events,
+            "api_id_set": bool(settings.api_id),
+        }
+
+    # ---------------- чекер ----------------
+    @app.post("/api/checker")
+    async def run_checker():
+        if not settings.api_id or not settings.api_hash:
+            raise HTTPException(400, "нужны API_ID и API_HASH (my.telegram.org)")
+        names = ctx.sessions.list_session_names()
+        if not names:
+            raise HTTPException(400, "нет сессий в каталоге sessions/")
+        task_id = uuid.uuid4().hex[:8]
+        _tasks[task_id] = {"status": "running", "type": "checker", "total": len(names)}
+        plugin = registry.instantiate("checker", _build_deps(ctx, settings))
+
+        async def work():
+            try:
+                await plugin.check(names, plugin._on_result)
+                _tasks[task_id]["status"] = "done"
+            except Exception as exc:  # noqa: BLE001
+                _tasks[task_id].update(status="error", error=str(exc))
+
+        asyncio.create_task(work())
+        return {"task_id": task_id}
+
+    # ---------------- broadcast ----------------
+    def _broadcast_plugin():
+        return registry.instantiate("broadcast", _build_deps(ctx, settings))
+
+    def _optin_list(plugin):
+        try:
+            subs = plugin._load_subscribers()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        optout = plugin._load_optout()
+        return [s for s in subs if s[0] not in optout]
+
+    @app.get("/api/broadcast/state")
+    async def broadcast_state():
+        plugin = _broadcast_plugin()
+        try:
+            subs = plugin._load_subscribers()
+        except ValueError as exc:
+            return {"subscribers": [], "optout": sorted(plugin._load_optout()), "error": str(exc)}
+        return {
+            "subscribers": [{"key": k, "consent": c, "source": s} for k, c, s in subs],
+            "optout": sorted(plugin._load_optout()),
+        }
+
+    @app.post("/api/broadcast/preview")
+    async def broadcast_preview(payload: dict):
+        message = (payload.get("message") or "").strip()
+        if not message:
+            raise HTTPException(400, "укажите текст сообщения")
+        subs = _optin_list(_broadcast_plugin())
+        return {
+            "count": len(subs),
+            "recipients": [{"key": k, "consent": c, "source": s} for k, c, s in subs[:200]],
+        }
+
+    @app.post("/api/broadcast/send")
+    async def broadcast_send(payload: dict):
+        message = (payload.get("message") or "").strip()
+        if not message:
+            raise HTTPException(400, "укажите текст сообщения")
+        if not settings.api_id or not settings.api_hash:
+            raise HTTPException(400, "для отправки нужны API_ID и API_HASH")
+        names = ctx.sessions.list_session_names()
+        if not names:
+            raise HTTPException(400, "нет сессий в каталоге sessions/")
+        plugin = _broadcast_plugin()
+        subs = _optin_list(plugin)
+        if not subs:
+            raise HTTPException(400, "некому отправлять (после opt-in/opt-out фильтров)")
+
+        task_id = uuid.uuid4().hex[:8]
+        _tasks[task_id] = {"status": "running", "type": "broadcast", "total": len(subs)}
+
+        async def work():
+            try:
+                await plugin._dispatch(names, subs, message)
+                _tasks[task_id]["status"] = "done"
+            except Exception as exc:  # noqa: BLE001
+                _tasks[task_id].update(status="error", error=str(exc))
+
+        asyncio.create_task(work())
+        return {"task_id": task_id, "recipients": len(subs)}
+
+    @app.post("/api/broadcast/unsubscribe")
+    async def broadcast_unsubscribe(payload: dict):
+        key = (payload.get("key") or "").strip()
+        if not key:
+            raise HTTPException(400, "укажите адресата")
+        _broadcast_plugin()._add_optout(key)
+        return {"ok": True}
+
+    # ---------------- спинтакс --------------
+    @app.post("/api/spintax/preview")
+    async def spintax_preview(payload: dict):
+        from core import spintax
+
+        text = (payload.get("text") or "").strip()
+        if not text:
+            raise HTTPException(400, "пустой текст")
+        if not spintax.has_spintax(text):
+            return {"has_spintax": False, "combinations": 1, "sample": [text]}
+        try:
+            combos = spintax.count_combinations(text)
+        except spintax.SpintaxError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {
+            "has_spintax": True,
+            "combinations": combos,
+            "sample": spintax.sample_variants(text, 5),
+        }
+
+    # ---------------- задачи ----------------
+    def _spawn_task(task_type: str, plugin, argv: list[str]) -> dict:
+        task_id = uuid.uuid4().hex[:8]
+        _tasks[task_id] = {"status": "running", "type": task_type}
+
+        async def work():
+            try:
+                await plugin.run(argv)
+                _tasks[task_id]["status"] = "done"
+            except SystemExit:  # argparse ошибку отдаёт как SystemExit
+                _tasks[task_id].update(status="error", error="неверные аргументы")
+            except Exception as exc:  # noqa: BLE001
+                _tasks[task_id].update(status="error", error=str(exc))
+
+        asyncio.create_task(work())
+        return {"task_id": task_id}
+
+    def _argv_from_payload(
+        payload: dict, flags: tuple[str, ...] = (), positional: tuple[str, ...] = (),
+        required: tuple[str, ...] = (),
+    ):
+        """Собирает argv для плагина из JSON-поля.
+
+        positional — ключи, чьи значения идут без флага (позиционные аргументы
+        CLI, например source/target); flags — булевы флаги (без значения);
+        остальные — '--ключ значение'.
+        """
+        argv: list[str] = []
+        for key, value in (payload or {}).items():
+            if value in (None, False):
+                continue
+            if key in positional:
+                argv.append(str(value))
+            elif value is True:
+                argv.append(f"--{key}")
+            else:
+                argv += [f"--{key}", str(value)]
+        for flag in flags:  # булевы флаги не принимают значение
+            if f"--{flag}" in argv:
+                i = argv.index(f"--{flag}")
+                del argv[i + 1]
+        for req in required:
+            if req in positional:
+                if not (payload or {}).get(req):
+                    raise HTTPException(400, f"не хватает аргумента {req}")
+            elif f"--{req}" not in argv:
+                raise HTTPException(400, f"не хватает аргумента --{req}")
+        return argv
+
+    @app.post("/api/parser/run")
+    async def parser_run(payload: dict):
+        if not settings.api_id or not settings.api_hash:
+            raise HTTPException(400, "нужны API_ID и API_HASH")
+        if not ctx.sessions.list_session_names():
+            raise HTTPException(400, "нет сессий в каталоге sessions/")
+        argv = _argv_from_payload(
+            payload, flags=("limit", "mode", "output"), positional=("source",), required=("source",)
+        )
+        return _spawn_task("parser", registry.instantiate("parser", _build_deps(ctx, settings)), argv)
+
+    @app.post("/api/inviter/run")
+    async def inviter_run(payload: dict):
+        if not settings.api_id or not settings.api_hash:
+            raise HTTPException(400, "нужны API_ID и API_HASH")
+        if not ctx.sessions.list_session_names():
+            raise HTTPException(400, "нет сессий в каталоге sessions/")
+        if payload.get("send") is not True:
+            raise HTTPException(400, "безопасный режим: передайте send=true для реального инвайта")
+        argv = _argv_from_payload(
+            payload, flags=("send", "limit"), positional=("target",), required=("target", "file")
+        )
+        return _spawn_task("inviter", registry.instantiate("inviter", _build_deps(ctx, settings)), argv)
+
+    @app.post("/api/cloner/run")
+    async def cloner_run(payload: dict):
+        if not settings.api_id or not settings.api_hash:
+            raise HTTPException(400, "нужны API_ID и API_HASH")
+        if not ctx.sessions.list_session_names():
+            raise HTTPException(400, "нет сессий в каталоге sessions/")
+        if payload.get("send") is not True:
+            raise HTTPException(400, "безопасный режим: передайте send=true для реального копирования")
+        argv = _argv_from_payload(
+            payload, flags=("send", "no-media", "no-meta", "history", "replace"),
+            positional=("source", "target"), required=("source", "target"),
+        )
+        return _spawn_task("cloner", registry.instantiate("cloner", _build_deps(ctx, settings)), argv)
+
+    @app.post("/api/autoresponder/run")
+    async def autoresponder_run(payload: dict):
+        if not settings.api_id or not settings.api_hash:
+            raise HTTPException(400, "нужны API_ID и API_HASH")
+        if not ctx.sessions.list_session_names():
+            raise HTTPException(400, "нет сессий в каталоге sessions/")
+        argv = _argv_from_payload(
+            payload, flags=("chat", "cooldown", "duration", "rules"), required=()
+        )
+        return _spawn_task("autoresponder", registry.instantiate("autoresponder", _build_deps(ctx, settings)), argv)
+
+    @app.post("/api/phonechecker/run")
+    async def phonechecker_run(payload: dict):
+        if not settings.api_id or not settings.api_hash:
+            raise HTTPException(400, "нужны API_ID и API_HASH")
+        if not ctx.sessions.list_session_names():
+            raise HTTPException(400, "нет сессий в каталоге sessions/")
+        argv = _argv_from_payload(
+            payload, flags=("batch", "limit"), required=("file",)
+        )
+        return _spawn_task("phonechecker", registry.instantiate("phonechecker", _build_deps(ctx, settings)), argv)
+
+    @app.post("/api/profiler/run")
+    async def profiler_run(payload: dict):
+        if payload.get("send") is not True:
+            raise HTTPException(400, "безопасный режим: передайте send=true для применения")
+        argv = _argv_from_payload(payload, flags=("send", "file", "avatar-dir"), required=())
+        return _spawn_task("profiler", registry.instantiate("profiler", _build_deps(ctx, settings)), argv)
+
+    @app.post("/api/reporter/run")
+    async def reporter_run(payload: dict):
+        if not settings.api_id or not settings.api_hash:
+            raise HTTPException(400, "нужны API_ID и API_HASH")
+        if payload.get("send") is not True:
+            raise HTTPException(400, "безопасный режим: передайте send=true для отправки жалоб")
+        argv = _argv_from_payload(
+            payload, flags=("send", "file", "reason", "comment", "limit"), required=()
+        )
+        return _spawn_task("reporter", registry.instantiate("reporter", _build_deps(ctx, settings)), argv)
+
+    @app.post("/api/booster/run")
+    async def booster_run(payload: dict):
+        if not settings.api_id or not settings.api_hash:
+            raise HTTPException(400, "нужны API_ID и API_HASH")
+        if payload.get("send") is not True:
+            raise HTTPException(400, "безопасный режим: передайте send=true для выполнения")
+        argv = _argv_from_payload(
+            payload, flags=("send", "limit", "reaction"), positional=("post",), required=("post",)
+        )
+        return _spawn_task("booster", registry.instantiate("booster", _build_deps(ctx, settings)), argv)
+
+    # ---------------- единый рантайм модулей (схемы + настройки) ----------------
+    schema_problems = [p for n, s in MODULE_SCHEMAS.items() for p in validate_schema_module(n, s)]
+    if schema_problems:
+        log.error("Проблемы в схемах модулей: %s", "; ".join(schema_problems))
+
+    @app.get("/api/schemas")
+    async def get_schemas():
+        """Схемы всех модулей + сохранённые настройки (для авто-форм UI)."""
+        return {
+            name: {
+                **schema,
+                "saved_config": ctx.storage.get_module_config(name),
+                "registered": registry.get(name) is not None,
+            }
+            for name, schema in MODULE_SCHEMAS.items()
+        }
+
+    @app.get("/api/config/{module}")
+    async def get_config(module: str):
+        if module not in MODULE_SCHEMAS:
+            raise HTTPException(404, "нет такого модуля")
+        return {"module": module, "config": ctx.storage.get_module_config(module)}
+
+    @app.post("/api/config/{module}")
+    async def save_config(module: str, payload: dict):
+        if module not in MODULE_SCHEMAS:
+            raise HTTPException(404, "нет такого модуля")
+        schema = MODULE_SCHEMAS[module]
+        allowed = {f["key"] for f in schema["fields"]}
+        clean = {k: v for k, v in (payload or {}).items() if k in allowed}
+        try:
+            build_argv(schema, clean)  # валидация обязательных полей
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        ctx.storage.set_module_config(module, clean)
+        ctx.storage.log_event("config", "info", f"настройки сохранены: {module}")
+        return {"ok": True, "saved": clean}
+
+    @app.post("/api/run/{module}")
+    async def run_module(module: str, payload: dict):
+        """Единая точка запуска: схема -> argv -> фоновая задача.
+
+        Dry-run по умолчанию: real-запуск только если в payload передан
+        send_flag=true (для модулей с send_flag).
+        """
+        schema = MODULE_SCHEMAS.get(module)
+        if not schema:
+            raise HTTPException(404, "нет такого модуля")
+        if not registry.get(module):
+            raise HTTPException(500, "модуль не зарегистрирован в реестре")
+        if schema.get("interactive"):
+            raise HTTPException(400, "модуль интерактивный — запустите через CLI: python -m cli " + module)
+        if schema.get("api_required") and not (settings.api_id and settings.api_hash):
+            raise HTTPException(400, "нужны API_ID и API_HASH (my.telegram.org)")
+        if schema.get("api_required") and not ctx.sessions.list_session_names():
+            raise HTTPException(400, "нет сессий в каталоге sessions/")
+        # значения формы: payload -> сохранённые настройки -> default из схемы
+        saved = ctx.storage.get_module_config(module)
+        merged = {
+            f["key"]: payload.get(f["key"], saved.get(f["key"], f.get("default")))
+            for f in schema["fields"]
+        }
+        merged[schema["send_flag"]] = bool(payload.get(schema["send_flag"])) if schema.get("send_flag") else False
+        try:
+            argv, real = build_argv(schema, merged)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        task = _spawn_task(module, registry.instantiate(module, _build_deps(ctx, settings)), argv)
+        task["real_run"] = real
+        return task
+
+    @app.get("/api/tasks/{task_id}")
+    async def task_status(task_id: str):
+        task = _tasks.get(task_id)
+        if not task:
+            raise HTTPException(404, "задача не найдена")
+        return task
+
+    return app
