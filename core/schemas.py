@@ -69,6 +69,19 @@ MODULE_SCHEMAS: dict[str, dict] = {
         "send_flag": "send",
         "api_required": True,
     },
+        "autodialer": {
+        "description": "Модуль автообдзвону (Voice AI). Телефонує клієнтам, відтворює аудіо та аналізує відповіді через ШІ.",
+        "fields": [
+            {"key": "phones", "label": "Номери телефонів (через новий рядок)", "type": "textarea", "default": ""},
+            {"key": "helperBot", "label": "Бот-помічник для посилань", "type": "text", "default": "@reeeeveerbot"},
+            {"key": "callsPerAccount", "label": "Дзвінків на 1 акаунт", "type": "number", "default": 5},
+            {"key": "listenTimeoutMs", "label": "Таймаут прослуховування (мс)", "type": "number", "default": 5000},
+            {"key": "headless", "label": "Прихований режим браузера", "type": "bool", "default": True}
+        ],
+        "positional": [],
+        "send_flag": "run_real",
+        "api_required": False,
+    },
     "autoresponder": {
         "fields": [
             {"key": "rules", "label": "Файл правил (пусто = data/autoresponder.txt)", "type": "text", "default": ""},

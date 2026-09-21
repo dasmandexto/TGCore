@@ -1,0 +1,8 @@
+﻿flask
+torch
+transformers
+openai-whisper
+librosa
+soundfile
+numpy
+huggingface_hub
